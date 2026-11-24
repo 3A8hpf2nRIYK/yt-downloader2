@@ -1,0 +1,293 @@
+name: YouTube Download
+
+# Dipicu oleh Cloudflare Worker lewat REST API workflow_dispatch,
+# bisa juga dijalankan manual dari tab Actions.
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: "ID chat Telegram tujuan"
+        required: true
+        type: string
+      youtube_url:
+        description: "Link YouTube"
+        required: true
+        type: string
+      format_choice:
+        description: "Format yang dipilih user (statis atau dinamis v<tinggi>, mis. v1440)"
+        required: false
+        default: "vid_720"
+        type: string
+      mode:
+        description: "download = unduh & kirim file | probe = cek format & ukuran lalu kirim tombol dinamis"
+        required: false
+        default: "download"
+        type: string
+      probe_message_id:
+        description: "(mode probe) ID pesan placeholder dari Worker"
+        required: false
+        default: ""
+        type: string
+      proxy:
+        description: "URL proxy untuk yt-dlp (var DEFAULT_PROXY Worker atau perintah proxy user). Kosong = tanpa proxy"
+        required: false
+        default: ""
+        type: string
+      proxy_custom:
+        description: "1 bila proxy berasal dari perintah user (bukan default)"
+        required: false
+        default: ""
+        type: string
+      use_vpn:
+        description: "1 = sambungkan OpenVPN sebelum download (config custom dari input ovpn_config, atau secret OPENVPN_CONFIG)"
+        required: false
+        default: ""
+        type: string
+      ovpn_config:
+        description: "Isi config .ovpn custom dari user (bila kosong, pakai secret OPENVPN_CONFIG)"
+        required: false
+        default: ""
+        type: string
+      ovpn_user:
+        description: "Username OpenVPN untuk config custom (bila kosong, pakai secret OPENVPN_USER)"
+        required: false
+        default: ""
+        type: string
+      ovpn_pass:
+        description: "Password OpenVPN untuk config custom (bila kosong, pakai secret OPENVPN_PASS)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+# Satu antrean per chat: download dari chat yang sama tidak saling tabrak,
+# chat berbeda tetap bisa jalan bersamaan.
+concurrency:
+  group: download-${{ inputs.chat_id }}
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: pip install -U -r downloader/requirements.txt
+
+      # Cookies YouTube bersifat OPSIONAL (secret YOUTUBE_COOKIES, format
+      # Netscape cookies.txt). Hanya ditulis ke file bila secret terisi.
+      # Step ini sengaja SEBELUM bgutil: smoke test bgutil memakai file ini.
+      - name: Siapkan cookies YouTube (opsional)
+        env:
+          YT_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -n "$YT_COOKIES" ]; then
+            printf '%s' "$YT_COOKIES" > "$RUNNER_TEMP/yt-cookies.txt"
+            echo "YT_COOKIES_FILE=$RUNNER_TEMP/yt-cookies.txt" >> "$GITHUB_ENV"
+            echo "Cookies YouTube terpasang dari secret."
+          else
+            echo "Secret YOUTUBE_COOKIES kosong, lanjut tanpa cookies."
+          fi
+
+      # Server PO-token (bgutil) mengotorisasi URL format client web
+      # (web, mweb, tv, web_embedded) agar tidak kena HTTP 403 saat unduh.
+      # Kegagalan di step ini TIDAK menggagalkan run — log step ini memuat
+      # status server + hasil smoke test untuk diagnosis.
+      - name: Nyalakan server PO-token bgutil (opsional)
+        continue-on-error: true
+        run: |
+          node --version; npm --version
+          git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bgutil
+          cd /tmp/bgutil/server
+          npm install --no-audit --no-fund
+          npx tsc
+          nohup node build/main.js > /tmp/bgutil.log 2>&1 &
+          for i in $(seq 1 15); do
+            curl -s http://127.0.0.1:4416/ > /dev/null && break || sleep 2
+          done
+          echo "--- Respons server bgutil ---"
+          curl -s http://127.0.0.1:4416/ || echo "bgutil tidak merespons"
+          echo "--- Log server bgutil ---"
+          tail -20 /tmp/bgutil.log || true
+          echo "--- Smoke test PO-token (client web + fetch_pot=always) ---"
+          if [ -n "$YT_COOKIES_FILE" ]; then
+            yt-dlp --verbose --simulate -f bestaudio --cookies "$YT_COOKIES_FILE" --extractor-args "youtube:player_client=web;fetch_pot=always" "https://www.youtube.com/watch?v=aqz-KE-bpKQ" 2>&1 | grep -iE "pot|token provider" | head -10 || true
+          else
+            yt-dlp --verbose --simulate -f bestaudio --extractor-args "youtube:player_client=web;fetch_pot=always" "https://www.youtube.com/watch?v=aqz-KE-bpKQ" 2>&1 | grep -iE "pot|token provider" | head -10 || true
+          fi
+
+      # OpenVPN (opsional, hanya bila user memilih salah satu jalur
+      # OpenVPN): seluruh trafik langkah download berjalan lewat VPN.
+      # Config custom dari user (input ovpn_config) didahulukan; bila
+      # kosong, pakai profile tersimpan di secret OPENVPN_CONFIG.
+      # Username/password mengikuti sumber yang sama (input dulu, lalu
+      # secret OPENVPN_USER / OPENVPN_PASS). Baris auth-user-pass di
+      # dalam config dibuang dan diganti file kredensial terpisah
+      # agar tidak bentrok.
+      - name: Hubungkan OpenVPN (bila diminta)
+        id: vpn
+        if: inputs.use_vpn == '1'
+        env:
+          OPENVPN_CONFIG: ${{ secrets.OPENVPN_CONFIG }}
+          OPENVPN_USER: ${{ secrets.OPENVPN_USER }}
+          OPENVPN_PASS: ${{ secrets.OPENVPN_PASS }}
+          OVPN_CONFIG_IN: ${{ inputs.ovpn_config }}
+          OVPN_USER_IN: ${{ inputs.ovpn_user }}
+          OVPN_PASS_IN: ${{ inputs.ovpn_pass }}
+        run: |
+          CONFIG="$OVPN_CONFIG_IN"
+          if [ -z "$CONFIG" ]; then CONFIG="$OPENVPN_CONFIG"; fi
+          if [ -z "$CONFIG" ]; then
+            echo "::error::Tidak ada config OpenVPN — secret OPENVPN_CONFIG kosong dan user tidak mengirim config custom."
+            exit 1
+          fi
+          OVPN_USER_EFF="$OVPN_USER_IN"
+          if [ -z "$OVPN_USER_EFF" ]; then OVPN_USER_EFF="$OPENVPN_USER"; fi
+          OVPN_PASS_EFF="$OVPN_PASS_IN"
+          if [ -z "$OVPN_PASS_EFF" ]; then OVPN_PASS_EFF="$OPENVPN_PASS"; fi
+          sudo apt-get install -y openvpn
+          printf '%s' "$CONFIG" | tr -d '\r' | grep -v '^auth-user-pass' > "$RUNNER_TEMP/client.ovpn"
+          AUTH_ARGS=""
+          if [ -n "$OVPN_USER_EFF" ]; then
+            printf '%s\n%s\n' "$OVPN_USER_EFF" "$OVPN_PASS_EFF" > "$RUNNER_TEMP/ovpn-auth.txt"
+            chmod 600 "$RUNNER_TEMP/ovpn-auth.txt"
+            AUTH_ARGS="--auth-user-pass $RUNNER_TEMP/ovpn-auth.txt"
+          fi
+          sudo openvpn --config "$RUNNER_TEMP/client.ovpn" $AUTH_ARGS --daemon --log "$RUNNER_TEMP/openvpn.log" --writepid "$RUNNER_TEMP/openvpn.pid"
+          ok=0
+          for i in $(seq 1 30); do
+            if sudo grep -q "Initialization Sequence Completed" "$RUNNER_TEMP/openvpn.log" 2>/dev/null; then ok=1; break; fi
+            pid="$(cat "$RUNNER_TEMP/openvpn.pid" 2>/dev/null || true)"
+            if [ -z "$pid" ] || ! sudo kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 2
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::OpenVPN gagal tersambung. Log terakhir:"
+            sudo tail -30 "$RUNNER_TEMP/openvpn.log" || true
+            exit 1
+          fi
+          echo "OpenVPN tersambung. Cek IP keluar (tunnel harus mengalirkan data):"
+          EXIT_IP=""
+          for i in 1 2; do
+            EXIT_IP="$(curl -s --max-time 15 https://ifconfig.me || true)"
+            if [ -z "$EXIT_IP" ]; then EXIT_IP="$(curl -s --max-time 15 https://icanhazip.com || true)"; fi
+            if [ -n "$EXIT_IP" ]; then break; fi
+            sleep 3
+          done
+          if [ -z "$EXIT_IP" ]; then
+            echo "::error::OpenVPN tersambung di atas kertas, tetapi tunnel tidak mengalirkan data (cek IP keluar kosong) — server VPN mati/blackhole. Step digagalkan agar kegagalannya diteruskan ke Telegram."
+            sudo tail -30 "$RUNNER_TEMP/openvpn.log" || true
+            exit 1
+          fi
+          echo "IP keluar: $EXIT_IP"
+
+      - name: Download / probe & kirim ke Telegram
+        env:
+          # Input diteruskan lewat env, BUKAN ditempel langsung di script run,
+          # supaya tidak bisa dipakai untuk injeksi perintah shell.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          YOUTUBE_URL: ${{ inputs.youtube_url }}
+          FORMAT_CHOICE: ${{ inputs.format_choice }}
+          MODE: ${{ inputs.mode }}
+          PROBE_MESSAGE_ID: ${{ inputs.probe_message_id }}
+          PROXY: ${{ inputs.proxy }}
+          PROXY_CUSTOM: ${{ inputs.proxy_custom }}
+          # Opsional: jalur kirim file besar 50 MB - 2 GB via MTProto.
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        run: python downloader/download.py
+
+      # Selalu putuskan VPN di akhir (termasuk bila download gagal),
+      # supaya koneksi runner ke GitHub pulih sebelum job ditutup.
+      - name: Putuskan OpenVPN
+        if: always() && inputs.use_vpn == '1'
+        run: |
+          if [ -f "$RUNNER_TEMP/openvpn.pid" ]; then
+            sudo kill "$(cat "$RUNNER_TEMP/openvpn.pid")" || true
+            sleep 2
+          fi
+          sudo pkill -x openvpn || true
+          echo "OpenVPN diputuskan."
+
+      # Bila step OpenVPN gagal, download.py tidak pernah jalan sehingga
+      # Telegram tidak menerima kabar apa pun dan chat menggantung di
+      # pesan "sedang diproses". Step ini meneruskan info kegagalannya ke
+      # Telegram beserta keyboard picker yang sama seperti pesan gagal
+      # download.py (callback px:...), jadi user bisa langsung memilih
+      # cara lain atau membatalkan tugas. Sengaja ditaruh SETELAH
+      # Putuskan OpenVPN agar rute jaringan runner sudah pulih dan
+      # api.telegram.org bisa dijangkau lagi.
+      - name: Beritahu Telegram bila OpenVPN gagal
+        if: failure() && steps.vpn.outcome == 'failure'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          YOUTUBE_URL: ${{ inputs.youtube_url }}
+          FORMAT_CHOICE: ${{ inputs.format_choice }}
+        run: |
+          REASON="OpenVPN gagal tersambung (penyebab pasti tidak terbaca dari log)."
+          LOG="$RUNNER_TEMP/openvpn.log"
+          if [ ! -f "$LOG" ]; then
+            REASON="Tidak ada config OpenVPN yang bisa dipakai — profile tersimpan kosong dan tidak ada config custom yang terkirim."
+          elif sudo grep -q "AUTH_FAILED" "$LOG"; then
+            REASON="Server VPN menolak login (AUTH_FAILED) — sertifikat config atau username/password tidak diterima server itu."
+          elif sudo grep -q "Initialization Sequence Completed" "$LOG"; then
+            REASON="Tunnel VPN tersambung tetapi tidak mengalirkan data (server blackhole) — download dibatalkan sebelum mulai."
+          elif sudo grep -q "Cannot resolve host address" "$LOG"; then
+            REASON="Alamat server VPN tidak ditemukan (DNS gagal) — kemungkinan baris remote pada config salah atau kosong."
+          elif sudo grep -q "Attempting to establish TCP connection" "$LOG"; then
+            REASON="Server VPN tidak menjawab sama sekali sampai timeout — server kemungkinan mati atau port-nya tidak bisa dijangkau."
+          elif sudo grep -q "TLS Error\|TLS handshake failed" "$LOG"; then
+            REASON="Handshake TLS ke server VPN gagal — server kemungkinan mati atau menolak koneksi."
+          fi
+          echo "Alasan kegagalan VPN: $REASON"
+          VPN_FAIL_REASON="$REASON" python3 - <<'PYEOF'
+          import json, os, re, urllib.request
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("CHAT_ID", "")
+          url = os.environ.get("YOUTUBE_URL", "")
+          choice = os.environ.get("FORMAT_CHOICE", "") or "vid_720"
+          reason = os.environ.get("VPN_FAIL_REASON", "OpenVPN gagal tersambung.")
+          m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", url)
+          if not token or not chat_id or not m:
+              print("Lewati notifikasi Telegram: token/chat_id/video-id tidak lengkap.")
+              raise SystemExit(0)
+          vid = m.group(1)
+          def kb(letter, text):
+              return [{"text": text, "callback_data": f"px:{vid}:{choice}:{letter}"}]
+          keyboard = {"inline_keyboard": [
+              kb("n", "⬇️ Download tanpa proxy"),
+              kb("c", "🔌 Download menggunakan proxy custom"),
+              kb("v", "🛡️ Gunakan profile OpenVPN yang tersimpan"),
+              kb("o", "📄 Gunakan custom config OpenVPN"),
+              kb("l", "🌐 Download config OpenVPN dari link"),
+              kb("x", "✖️ Batalkan / Cancel tugas"),
+          ]}
+          text = ("❌ Download batal sebelum dimulai.\n"
+                  f"🛡️ {reason}\n\n"
+                  "Mau coba lagi dengan cara lain, atau batalkan tugas ini?")
+          payload = json.dumps({"chat_id": chat_id, "text": text,
+                                "reply_markup": keyboard}).encode()
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data=payload, headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  print("Notifikasi kegagalan VPN terkirim ke Telegram, status:", r.status)
+          except Exception as e:
+              print("Tidak bisa mengirim notifikasi ke Telegram:", e)
+          PYEOF
