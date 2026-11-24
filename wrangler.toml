@@ -1,4 +1,4 @@
-name = "youtube-telegram-bot"
+name = "yt-downloader2"
 main = "worker/src/index.js"
 compatibility_date = "2024-12-01"
 
@@ -11,8 +11,8 @@ compatibility_date = "2024-12-01"
 # Secrets TIDAK ditulis di sini — set lewat Dashboard / `wrangler secret put`:
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, GITHUB_TOKEN
 [vars]
-GITHUB_OWNER = "43VfQLAv0MTy"
-GITHUB_REPO = "yt-downloader-bot"
+GITHUB_OWNER = "3A8hpf2nRIYK"
+GITHUB_REPO = "yt-downloader2"
 GITHUB_REF = "main"
 ALLOWED_USER_IDS = ""
 # Catatan: var DEFAULT_PROXY tidak dipakai lagi. Sejak alur "pilih cara
