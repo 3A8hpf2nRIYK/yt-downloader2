@@ -1,0 +1,20 @@
+name = "youtube-telegram-bot"
+main = "worker/src/index.js"
+compatibility_date = "2024-12-01"
+
+# File ini SENGAJA di root repo: Cloudflare Workers Builds menjalankan
+# `npx wrangler deploy` dari root, jadi wrangler.toml harus ditemukan di sini.
+# Kalau file ini hanya ada di subfolder, deploy gagal dengan error
+# "Could not detect a directory containing static files".
+#
+# Repo tujuan: github.com/43VfQLAv0MTy/yt-downloader-bot
+# Secrets TIDAK ditulis di sini — set lewat Dashboard / `wrangler secret put`:
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, GITHUB_TOKEN
+[vars]
+GITHUB_OWNER = "43VfQLAv0MTy"
+GITHUB_REPO = "yt-downloader-bot"
+GITHUB_REF = "main"
+ALLOWED_USER_IDS = ""
+# Catatan: var DEFAULT_PROXY tidak dipakai lagi. Sejak alur "pilih cara
+# download", probe & download default-nya tanpa proxy; proxy custom
+# dipilih user per-download dari tombol di chat (lihat README).
