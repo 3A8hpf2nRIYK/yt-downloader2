@@ -206,6 +206,10 @@ jobs:
           PROBE_MESSAGE_ID: ${{ inputs.probe_message_id }}
           PROXY: ${{ inputs.proxy }}
           PROXY_CUSTOM: ${{ inputs.proxy_custom }}
+          # Cara yang dipakai run ini, untuk download.py: tombol format
+          # hasil probe membawa cara yang sama (lihat _reuse_suffix_for).
+          USE_VPN: ${{ inputs.use_vpn }}
+          OVPN_CUSTOM: ${{ inputs.ovpn_config != '' }}
           # Opsional: jalur kirim file besar 50 MB - 2 GB via MTProto.
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -227,8 +231,9 @@ jobs:
       # Telegram tidak menerima kabar apa pun dan chat menggantung di
       # pesan "sedang diproses". Step ini meneruskan info kegagalannya ke
       # Telegram beserta keyboard picker yang sama seperti pesan gagal
-      # download.py (callback px:...), jadi user bisa langsung memilih
-      # cara lain atau membatalkan tugas. Sengaja ditaruh SETELAH
+      # download.py (callback px:... — atau pre:... bila run ini mode
+      # probe), jadi user bisa langsung memilih cara lain atau
+      # membatalkan tugas. Sengaja ditaruh SETELAH
       # Putuskan OpenVPN agar rute jaringan runner sudah pulih dan
       # api.telegram.org bisa dijangkau lagi.
       - name: Beritahu Telegram bila OpenVPN gagal
@@ -267,8 +272,13 @@ jobs:
               print("Lewati notifikasi Telegram: token/chat_id/video-id tidak lengkap.")
               raise SystemExit(0)
           vid = m.group(1)
+          # Bila run ini mode probe (FORMAT_CHOICE == "probe"), tombolnya
+          # harus menu probe ("pre:<vid>:<aksi>"), bukan menu download —
+          # callback "px:<vid>:probe:<aksi>" tidak dikenal Worker.
+          is_probe = choice == "probe"
           def kb(letter, text):
-              return [{"text": text, "callback_data": f"px:{vid}:{choice}:{letter}"}]
+              cb = f"pre:{vid}:{letter}" if is_probe else f"px:{vid}:{choice}:{letter}"
+              return [{"text": text, "callback_data": cb}]
           keyboard = {"inline_keyboard": [
               kb("n", "⬇️ Download tanpa proxy"),
               kb("c", "🔌 Download menggunakan proxy custom"),
@@ -277,7 +287,9 @@ jobs:
               kb("l", "🌐 Download config OpenVPN dari link"),
               kb("x", "✖️ Batalkan / Cancel tugas"),
           ]}
-          text = ("❌ Download batal sebelum dimulai.\n"
+          head = ("❌ Pengecekan batal sebelum dimulai.\n" if is_probe
+                  else "❌ Download batal sebelum dimulai.\n")
+          text = (head +
                   f"🛡️ {reason}\n\n"
                   "Mau coba lagi dengan cara lain, atau batalkan tugas ini?")
           payload = json.dumps({"chat_id": chat_id, "text": text,
