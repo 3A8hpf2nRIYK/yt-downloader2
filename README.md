@@ -114,11 +114,17 @@ Setelah ini bot tidak lagi pakai polling — versi `bot.py` lama jangan dijalank
 ### 6. Tes
 
 1. Chat `/start` ke bot → harus dibalas Worker (cepat).
-2. Kirim link YouTube → bot membalas "sedang memeriksa kualitas & ukuran".
-3. ±1 menit kemudian muncul foto + tombol format dinamis dari run **probe**:
+2. Kirim link YouTube → bot menampilkan 6 pilihan cara download
+   (tanpa proxy / proxy custom / OpenVPN tersimpan / custom config /
+   config dari link / batal). Pilih salah satu.
+3. ±1 menit kemudian muncul foto + tombol format dinamis dari run **probe**
+   (probe memakai cara yang kamu pilih tadi):
    hanya resolusi yang benar-benar tersedia (maks 4320p/8K), tiap tombol
    ada perkiraan ukurannya.
-4. Klik format → Worker membalas "sedang diproses di GitHub Actions".
+4. Klik format → download langsung jalan dengan cara yang sama seperti
+   saat cek (kecuali config OpenVPN custom — config-nya perlu dikirim
+   ulang saat bot menanyakannya lagi setelah klik format); Worker
+   membalas "sedang diproses di GitHub Actions".
 5. Cek tab **Actions** di repo: run `YouTube Download` harus muncul.
 6. File terkirim ke chat setelah run selesai.
 
@@ -133,8 +139,18 @@ pilih audio.
 
 ## Proxy & VPN (opsional)
 
-Probe dan download **default-nya tanpa proxy**. Setelah user mengklik
-resolusi, bot menawarkan 6 pilihan cara download:
+Saat user mengirim link, bot **langsung** menawarkan 6 pilihan cara —
+cara itu dipakai dulu untuk probe (cek kualitas), lalu dipakai lagi
+untuk download setelah user mengklik format. Sebelumnya probe selalu
+jalan tanpa proxy, jadi sering mentok bot-check YouTube ("Sign in to
+confirm you're not a bot") sebelum user sempat memilih proxy/VPN;
+sekarang probe sudah berjalan lewat cara yang dipilih. Satu
+pengecualian: config OpenVPN custom tidak bisa dibawa dari probe ke
+download (bot tidak menyimpan config, dan tombol Telegram dibatasi
+64 byte), jadi setelah klik format bot menanyakan lagi cara
+download-nya. Bila probe gagal, pesan gagalnya menampilkan keenam
+tombol yang sama, jadi user bisa langsung mencoba cara lain tanpa
+mengirim link ulang.
 
 - **⬇️ Download tanpa proxy** — langsung diproses tanpa proxy.
 - **🔌 Download menggunakan proxy custom** — bot membalas dengan pesan
@@ -185,6 +201,7 @@ mengulang dari awal.
 | Gejala | Cek |
 |---|---|
 | Cloudflare Builds gagal: `Could not detect a directory containing static files` | `npx wrangler deploy` jalan dari root repo tapi `wrangler.toml` tidak ditemukan di root — pastikan `wrangler.toml` ada di root (bukan hanya di subfolder) dengan `main = "worker/src/index.js"`, atau set *Root directory* = `worker` di Settings → Builds bila memakai struktur lama |
+| Probe gagal "Sign in to confirm you're not a bot" | IP runner GitHub sedang diblokir YouTube. Pilih proxy custom / OpenVPN saat kirim link (probe memakai cara itu); pesan gagal probe juga menampilkan keenam tombol untuk mencoba cara lain tanpa kirim link ulang |
 | Klik tombol → "Gagal memulai download (HTTP 404)" | `GITHUB_OWNER`/`GITHUB_REPO` salah, atau `download.yml` belum ada di branch `main` |
 | Klik tombol → HTTP 401/403 | `GITHUB_TOKEN` kedaluwarsa / tidak punya izin Actions: write |
 | Run Actions gagal di langkah kirim | Secret `TELEGRAM_BOT_TOKEN` di repo kosong / salah |

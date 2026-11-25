@@ -3,31 +3,43 @@
  * ===========================================================
  * Tugas Worker ini HANYA:
  *   1. Terima webhook Telegram
- *   2. Saat user mengirim link: kirim pesan placeholder, lalu trigger
- *      GitHub Actions mode "probe" — probe mengekstrak format yang
- *      benar-benar tersedia (s/d 8K) + perkiraan ukurannya, lalu mengirim
- *      foto + tombol format dinamis ke chat. Probe selalu TANPA proxy.
- *   3. Saat tombol resolusi diklik, user memilih cara download lewat
- *      5 tombol + batal: tanpa proxy / proxy custom / profile OpenVPN
- *      tersimpan / custom config OpenVPN / batal. "Tanpa proxy"
- *      langsung trigger mode "download"; "proxy custom" membalas user
- *      dengan pesan perintah (force reply) yang membawa kode tugas
- *      "px:<videoId>:<choice>" — user membalasnya dengan URL proxy,
- *      lalu download ditrigger memakai proxy itu. "Profile tersimpan"
- *      mentrigger download dengan input use_vpn=1 (workflow
- *      menyambungkan VPN dari secret OPENVPN_CONFIG). "Custom config"
- *      meminta user membalas prompt dengan file .ovpn, tempelan teks
- *      config, atau link raw config (Worker mengambilnya dari link
- *      itu); bila config butuh login (ada baris auth-user-pass), bot
- *      meminta username + password dalam satu balasan lagi — prompt
- *      kedua membawa serta config-nya karena Worker tidak punya
- *      penyimpanan: file_id untuk config berkas
+ *   2. Saat user mengirim link: LANGSUNG tampilkan menu cara download
+ *      (tanpa proxy / proxy custom / profile OpenVPN tersimpan /
+ *      custom config OpenVPN / config OpenVPN dari link / batal).
+ *      Cara yang dipilih dipakai dulu untuk probe — probe mengekstrak
+ *      format yang benar-benar tersedia (s/d 8K) + perkiraan ukurannya,
+ *      lalu mengirim foto + tombol format dinamis ke chat. Probe yang
+ *      jalan tanpa proxy dulu sering mentok di bot-check YouTube
+ *      ("Sign in to confirm you're not a bot") sebelum user sempat
+ *      memilih proxy/VPN; dengan pilihan di awal, probe sudah berjalan
+ *      lewat proxy/VPN yang dipilih.
+ *   3. Saat tombol resolusi diklik, download langsung dimulai dengan
+ *      cara yang SAMA seperti saat probe (cara itu dibawa tombol format
+ *      dari downloader, "dl:<videoId>:<choice>|<n|v|p<proxy>>") —
+ *      kecuali bila probe memakai config OpenVPN custom (config tidak
+ *      bisa dibawa lewat tombol, batas callback Telegram 64 byte),
+ *      maka menu cara download ditampilkan lagi seperti dulu.
+ *      "Tanpa proxy" langsung trigger mode "download"; "proxy custom"
+ *      membalas user dengan pesan perintah (force reply) yang membawa
+ *      kode tugas "px:<videoId>:<choice>" — user membalasnya dengan
+ *      URL proxy, lalu download ditrigger memakai proxy itu.
+ *      "Profile tersimpan" mentrigger download dengan input use_vpn=1
+ *      (workflow menyambungkan VPN dari secret OPENVPN_CONFIG).
+ *      "Custom config" meminta user membalas prompt dengan file .ovpn,
+ *      tempelan teks config, atau link raw config (Worker mengambilnya
+ *      dari link itu); bila config butuh login (ada baris
+ *      auth-user-pass), bot meminta username + password dalam satu
+ *      balasan lagi — prompt kedua membawa serta config-nya karena
+ *      Worker tidak punya penyimpanan: file_id untuk config berkas
  *      (ovpnfile:<file_id>), atau isi config tersemat di antara
  *      penanda ovpncfg:begin/ovpncfg:end untuk config teks/link yang
  *      cukup pendek. Config lalu diteruskan ke workflow sebagai
  *      input ovpn_config. Pilihan yang sama juga muncul di
  *      pesan gagal dari downloader, jadi user bisa langsung mencoba
  *      cara lain tanpa mengulang dari awal.
+ *      Untuk probe, kode tugasnya "pre:<videoId>" (tanpa choice,
+ *      karena format belum dipilih) dan alur balasannya sama persis,
+ *      hanya akhirnya mentrigger mode "probe", bukan "download".
  *
  * Download TIDAK dilakukan di Worker: Workers tidak bisa menjalankan
  * yt-dlp / ffmpeg, tidak punya filesystem, dan memori cuma 128 MB.
@@ -229,6 +241,23 @@ function downloadChoiceKeyboard(videoId, choice) {
   };
 }
 
+// Keyboard yang sama persis, tapi untuk PROBE (sebelum format dipilih).
+// Callback-nya "pre:<videoId>:<aksi>" — tanpa choice, karena format
+// baru diketahui setelah probe berhasil. Dipakai saat user pertama
+// kali mengirim link, dan di pesan gagal probe dari downloader.
+function probeChoiceKeyboard(videoId) {
+  return {
+    inline_keyboard: [
+      [{ text: "⬇️ Download tanpa proxy", callback_data: `pre:${videoId}:n` }],
+      [{ text: "🔌 Download menggunakan proxy custom", callback_data: `pre:${videoId}:c` }],
+      [{ text: "🛡️ Gunakan profile OpenVPN yang tersimpan", callback_data: `pre:${videoId}:v` }],
+      [{ text: "📄 Gunakan custom config OpenVPN", callback_data: `pre:${videoId}:o` }],
+      [{ text: "🌐 Download config OpenVPN dari link", callback_data: `pre:${videoId}:l` }],
+      [{ text: "✖️ Batalkan / Cancel tugas", callback_data: `pre:${videoId}:x` }],
+    ],
+  };
+}
+
 async function clearKeyboard(env, chatId, messageId) {
   if (!messageId) return;
   await tg(env, "editMessageReplyMarkup", {
@@ -269,6 +298,41 @@ async function startDownload(env, { chatId, videoId, choice, proxy = "", useVpn 
   return result.ok;
 }
 
+// Trigger mode probe + kirim pesan placeholder "sedang memeriksa".
+// Probe memakai proxy/VPN yang sama seperti yang akan dipakai download,
+// supaya tidak mentok bot-check YouTube sebelum user sempat memilih cara.
+async function startProbe(env, { chatId, videoId, proxy = "", useVpn = false, ovpn = null }) {
+  const placeholder = await tg(env, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      "🔍 Sedang memeriksa kualitas & ukuran yang tersedia...\n" +
+      "(sekitar 1 menit, prosesnya di GitHub Actions)" +
+      (proxy ? `\n🔌 Proxy: ${maskProxy(proxy)}` : "") +
+      (useVpn && ovpn ? "\n🛡️ VPN: OpenVPN (custom config)" : "") +
+      (useVpn && !ovpn ? "\n🛡️ VPN: OpenVPN (profile tersimpan)" : ""),
+  });
+  const probeMessageId = placeholder?.result?.message_id || "";
+  const result = await triggerGithubActions(env, {
+    chatId, videoId, choice: "probe", mode: "probe", probeMessageId,
+    proxy, proxyCustom: !!proxy, useVpn,
+    ovpnConfig: ovpn?.config || "", ovpnUser: ovpn?.user || "", ovpnPass: ovpn?.pass || "",
+  });
+  if (!result.ok) {
+    console.error("GitHub dispatch probe gagal", result.status, result.body);
+    const errText =
+      `❌ Gagal memulai pengecekan di GitHub Actions (HTTP ${result.status}).\n` +
+      "Cek: GITHUB_TOKEN masih berlaku? Nama repo di GITHUB_OWNER/GITHUB_REPO sudah benar? " +
+      "Workflow download.yml sudah ada di branch main?";
+    if (probeMessageId) {
+      await tg(env, "editMessageText", { chat_id: chatId, message_id: probeMessageId, text: errText }).catch(() => {});
+    } else {
+      await tg(env, "sendMessage", { chat_id: chatId, text: errText });
+    }
+  }
+  return result.ok;
+}
+
 // ---------------------------------------------------------------- handlers
 async function handleMessage(env, message) {
   const chatId = message.chat.id;
@@ -287,12 +351,33 @@ async function handleMessage(env, message) {
   // jadi kode tugas dibaca dari pesan yang dibalas).
   const replied = message.reply_to_message;
   if (replied && replied.from?.is_bot) {
-    const token = String(replied.text || replied.caption || "")
-      .match(/px:([\w-]{11}):([a-z0-9_]+)/);
-    if (token && choiceLabel(token[2])) {
-      const [, pendingVideoId, pendingChoice] = token;
-      const repliedText = String(replied.text || replied.caption || "");
-      const pendingLabel = choiceLabel(pendingChoice) || pendingChoice;
+    const repliedText = String(replied.text || replied.caption || "");
+    // Dua macam tugas menunggu balasan user:
+    //  - download: "px:<videoId>:<choice>" (format sudah dipilih)
+    //  - probe:    "pre:<videoId>" (format belum dipilih; balasan ini
+    //    menentukan cara probe, lalu download memakai cara yang sama)
+    const pxToken = repliedText.match(/px:([\w-]{11}):([a-z0-9_]+)/);
+    const preToken = !pxToken && repliedText.match(/pre:([\w-]{11})\b/);
+    const pendingKind = pxToken ? "download" : preToken ? "probe" : null;
+    if (pendingKind && (pendingKind === "probe" || choiceLabel(pxToken[2]))) {
+      const pendingVideoId = pendingKind === "probe" ? preToken[1] : pxToken[1];
+      const pendingChoice = pendingKind === "probe" ? "probe" : pxToken[2];
+      const pendingCode = pendingKind === "probe"
+        ? `pre:${pendingVideoId}`
+        : `px:${pendingVideoId}:${pendingChoice}`;
+      const pendingLabel = pendingKind === "probe"
+        ? "cek kualitas"
+        : choiceLabel(pendingChoice) || pendingChoice;
+
+      // Penyelesaian tugas menunggu: probe atau download, sesuai jenisnya.
+      const finishPending = async ({ proxy = "", useVpn = false, ovpn = null } = {}) => {
+        if (pendingKind === "probe") {
+          return startProbe(env, { chatId, videoId: pendingVideoId, proxy, useVpn, ovpn });
+        }
+        return startDownload(env, {
+          chatId, videoId: pendingVideoId, choice: pendingChoice, proxy, useVpn, ovpn,
+        });
+      };
 
       // Langkah kredensial config OpenVPN custom: prompt kedua membawa
       // config-nya serta — "ovpnfile:<file_id>" untuk config berkas
@@ -327,18 +412,21 @@ async function handleMessage(env, message) {
         if (!cfg || !looksLikeOvpn(cfg) || cfg.length > 60000) {
           await tg(env, "sendMessage", {
             chat_id: chatId,
-            text: "❌ Config OpenVPN-nya tidak bisa dibaca lagi. Ulangi dari pilihan resolusi ya.",
+            text: pendingKind === "probe"
+              ? "❌ Config OpenVPN-nya tidak bisa dibaca lagi. Kirim link-nya lagi ya."
+              : "❌ Config OpenVPN-nya tidak bisa dibaca lagi. Ulangi dari pilihan resolusi ya.",
           });
           return;
         }
         if (replied.message_id) {
           await tg(env, "editMessageText", {
             chat_id: chatId, message_id: replied.message_id,
-            text: "✅ Kredensial diterima. Download dimulai...",
+            text: pendingKind === "probe"
+              ? "✅ Kredensial diterima. Pengecekan dimulai..."
+              : "✅ Kredensial diterima. Download dimulai...",
           }).catch(() => {});
         }
-        await startDownload(env, {
-          chatId, videoId: pendingVideoId, choice: pendingChoice,
+        await finishPending({
           useVpn: true, ovpn: { config: cfg, user, pass },
         });
         return;
@@ -376,14 +464,14 @@ async function handleMessage(env, message) {
         }
         if (ovpnNeedsAuth(cfg)) {
           if (fileId) {
-            await sendCredPrompt(`<code>px:${pendingVideoId}:${pendingChoice}\novpnfile:${fileId}</code>`);
+            await sendCredPrompt(`<code>${pendingCode}\novpnfile:${fileId}</code>`);
           } else if (sourceUrl) {
-            await sendCredPrompt(`<code>px:${pendingVideoId}:${pendingChoice}\novpnurl:${escapeHtml(sourceUrl)}</code>`);
+            await sendCredPrompt(`<code>${pendingCode}\novpnurl:${escapeHtml(sourceUrl)}</code>`);
           } else if (cfg.length <= 3500) {
             // Config teks: sematkan isinya di prompt kredensial
             // (diapit penanda ovpncfg) karena tidak ada file_id/URL.
             await sendCredPrompt(
-              `<code>px:${pendingVideoId}:${pendingChoice}</code>\n` +
+              `<code>${pendingCode}</code>\n` +
               "ovpncfg:begin\n" +
               `<code>${escapeHtml(cfg)}</code>\n` +
               "ovpncfg:end");
@@ -401,11 +489,12 @@ async function handleMessage(env, message) {
         if (replied.message_id) {
           await tg(env, "editMessageText", {
             chat_id: chatId, message_id: replied.message_id,
-            text: "✅ Config diterima. Download dimulai...",
+            text: pendingKind === "probe"
+              ? "✅ Config diterima. Pengecekan dimulai..."
+              : "✅ Config diterima. Download dimulai...",
           }).catch(() => {});
         }
-        await startDownload(env, {
-          chatId, videoId: pendingVideoId, choice: pendingChoice,
+        await finishPending({
           useVpn: true, ovpn: { config: cfg },
         });
       };
@@ -497,12 +586,12 @@ async function handleMessage(env, message) {
       if (replied.message_id) {
         await tg(env, "editMessageText", {
           chat_id: chatId, message_id: replied.message_id,
-          text: `✅ Proxy diterima (${maskProxy(candidate)}). Download dimulai...`,
+          text: pendingKind === "probe"
+            ? `✅ Proxy diterima (${maskProxy(candidate)}). Pengecekan dimulai...`
+            : `✅ Proxy diterima (${maskProxy(candidate)}). Download dimulai...`,
         }).catch(() => {});
       }
-      await startDownload(env, {
-        chatId, videoId: pendingVideoId, choice: pendingChoice, proxy: candidate,
-      });
+      await finishPending({ proxy: candidate });
       return;
     }
   }
@@ -513,11 +602,7 @@ async function handleMessage(env, message) {
       parse_mode: "HTML",
       text:
         "👋 <b>YouTube Downloader Bot</b>\n\n" +
-        "Kirimkan link YouTube, nanti aku cek dulu kualitas yang tersedia " +
-        "(sampai 8K bila ada) lengkap dengan perkiraan ukurannya:\n" +
-        "🎬 <b>Video</b> — sesuai resolusi asli video\n" +
-        "🎵 <b>Audio</b> — MP3 / M4A\n\n" +
-        "Setelah kamu klik resolusi, pilih cara download-nya:\n" +
+        "Kirimkan link YouTube, lalu pilih dulu cara download-nya:\n" +
         "⬇️ <b>Download tanpa proxy</b> — langsung diproses\n" +
         "🔌 <b>Download menggunakan proxy custom</b> — kamu akan diminta " +
         "mengirim URL proxy, lalu download memakai proxy itu\n" +
@@ -530,6 +615,14 @@ async function handleMessage(env, message) {
         "link unduhan config-nya (mis. VPNGate), bot yang mengambil " +
         "config-nya\n" +
         "✖️ <b>Batalkan / Cancel tugas</b> — batalkan tugas\n\n" +
+        "Cara yang kamu pilih dipakai dulu untuk mengecek kualitas yang " +
+        "tersedia (sampai 8K bila ada) lengkap dengan perkiraan " +
+        "ukurannya — 🎬 <b>Video</b> sesuai resolusi asli, 🎵 <b>Audio</b> " +
+        "MP3 / M4A — supaya pengecekan tidak mentok bot-check YouTube. " +
+        "Setelah kamu klik format, download langsung jalan dengan cara " +
+        "yang sama. Satu pengecualian: config OpenVPN custom harus " +
+        "dikirim ulang setelah pilih format, karena bot tidak menyimpan " +
+        "config.\n\n" +
         "Bila download gagal, keenam pilihan itu muncul lagi di pesan " +
         "gagalnya, jadi bisa langsung mencoba cara lain.\n\n" +
         "⚠️ Pengecekan &amp; download dijalankan di GitHub Actions, jadi " +
@@ -548,30 +641,22 @@ async function handleMessage(env, message) {
     return;
   }
 
-  // Placeholder dulu, lalu probe di GitHub Actions yang menggantinya dengan
-  // foto + tombol format dinamis (resolusi tersedia + perkiraan ukuran).
-  // Probe selalu berjalan TANPA proxy.
-  const placeholder = await tg(env, "sendMessage", {
+  // Link diterima: JANGAN langsung probe. Tampilkan dulu menu cara
+  // download (tombol yang sama seperti di foto menu) — cara yang dipilih
+  // dipakai untuk probe, supaya probe tidak mentok bot-check YouTube
+  // sebelum user sempat memilih proxy/VPN. Probe dipicu dari callback
+  // "pre:<videoId>:<aksi>" di handleCallback.
+  await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: "🔍 Sedang memeriksa kualitas & ukuran yang tersedia...\n(sekitar 1 menit, prosesnya di GitHub Actions)",
+    parse_mode: "HTML",
+    text:
+      "🔍 <b>Link diterima.</b>\n" +
+      "Pilih dulu cara mengecek &amp; download video ini — pengecekan " +
+      "kualitas (sampai 8K bila ada) akan memakai cara yang sama, " +
+      "supaya tidak mentok bot-check YouTube. Setelah kamu klik format, " +
+      "download langsung jalan dengan cara yang sama.",
+    reply_markup: probeChoiceKeyboard(videoId),
   });
-  const probeMessageId = placeholder?.result?.message_id || "";
-
-  const result = await triggerGithubActions(env, {
-    chatId, videoId, choice: "probe", mode: "probe", probeMessageId,
-  });
-  if (!result.ok) {
-    console.error("GitHub dispatch probe gagal", result.status, result.body);
-    const errText =
-      `❌ Gagal memulai pengecekan di GitHub Actions (HTTP ${result.status}).\n` +
-      "Cek: GITHUB_TOKEN masih berlaku? Nama repo di GITHUB_OWNER/GITHUB_REPO sudah benar? " +
-      "Workflow download.yml sudah ada di branch main?";
-    if (probeMessageId) {
-      await tg(env, "editMessageText", { chat_id: chatId, message_id: probeMessageId, text: errText }).catch(() => {});
-    } else {
-      await tg(env, "sendMessage", { chat_id: chatId, text: errText });
-    }
-  }
 }
 
 async function handleCallback(env, query) {
@@ -585,7 +670,169 @@ async function handleCallback(env, query) {
     return;
   }
 
+  // Tombol format dari hasil probe: dl:<videoId>:<choice>[|<cara>]
+  // <cara> dibawa dari probe (downloader yang menyematkannya):
+  //   n = tanpa proxy, v = profile OpenVPN tersimpan,
+  //   p<proxy> = proxy custom yang dipakai probe.
+  // Bila ada, download langsung jalan dengan cara yang sama — user tidak
+  // perlu memilih lagi. Bila tidak ada (probe memakai config OpenVPN
+  // custom, atau tombol dari probe lama), tampilkan menu cara download.
+  // Diparse manual (bukan split(":")) karena proxy di <cara> mengandung ":".
+  if (data.startsWith("dl:")) {
+    const rest = data.slice(3);
+    const sep = rest.indexOf(":");
+    if (sep < 0) return;
+    const videoId = rest.slice(0, sep);
+    const choiceRaw = rest.slice(sep + 1);
+    const [choice, method] = String(choiceRaw).split("|");
+
+    if (choice === "cancel") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+      if (messageId) {
+        await tg(env, "editMessageCaption", { chat_id: chatId, message_id: messageId, caption: "✖️ Dibatalkan." }).catch(() => {});
+      }
+      return;
+    }
+    const label = choiceLabel(choice);
+    if (!label) return;
+
+    if (method === "n") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `${label} — tanpa proxy (sama seperti saat cek), diproses...` });
+      await clearKeyboard(env, chatId, messageId);
+      await startDownload(env, { chatId, videoId, choice, proxy: "" });
+      return;
+    }
+    if (method === "v") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `${label} — profile OpenVPN tersimpan (sama seperti saat cek), diproses...` });
+      await clearKeyboard(env, chatId, messageId);
+      await startDownload(env, { chatId, videoId, choice, useVpn: true });
+      return;
+    }
+    if (method && method.startsWith("p")) {
+      const proxy = normalizeProxyToken(method.slice(1));
+      if (proxy) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `${label} — proxy yang sama seperti saat cek, diproses...` });
+        await clearKeyboard(env, chatId, messageId);
+        await startDownload(env, { chatId, videoId, choice, proxy });
+        return;
+      }
+      // Proxy dari tombol tidak valid — jatuh ke menu di bawah.
+    }
+
+    // Tidak ada cara bawaan: tawarkan dulu 6 cara download.
+    await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `${label} — pilih cara download.` });
+    await clearKeyboard(env, chatId, messageId);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text: `<b>${label}</b>\nPilih cara download:`,
+      reply_markup: downloadChoiceKeyboard(videoId, choice),
+    });
+    return;
+  }
+
   const parts = data.split(":");
+
+  // Menu cara PROBE (saat link pertama dikirim): pre:<videoId>:<n|c|v|o|l|x>
+  // (n = tanpa proxy, c = proxy custom, v = profile OpenVPN tersimpan,
+  //  o = custom config OpenVPN, l = config OpenVPN dari link,
+  //  x = batalkan). Pilihan di sini menentukan cara probe; download
+  // nanti memakai cara yang sama (kecuali config OpenVPN custom).
+  if (parts.length === 3 && parts[0] === "pre") {
+    const [, videoId, action] = parts;
+
+    if (action === "x") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Dibatalkan." });
+      await clearKeyboard(env, chatId, messageId);
+      if (messageId) {
+        await tg(env, "editMessageText", {
+          chat_id: chatId, message_id: messageId, text: "✖️ Tugas dibatalkan.",
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === "n") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Cek tanpa proxy, diproses..." });
+      await clearKeyboard(env, chatId, messageId);
+      await startProbe(env, { chatId, videoId, proxy: "" });
+      return;
+    }
+
+    if (action === "v") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Cek via profile OpenVPN tersimpan, diproses..." });
+      await clearKeyboard(env, chatId, messageId);
+      await startProbe(env, { chatId, videoId, useVpn: true });
+      return;
+    }
+
+    if (action === "o") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Balas pesan perintah dengan config .ovpn-nya." });
+      await clearKeyboard(env, chatId, messageId);
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text:
+          "📄 <b>Gunakan custom config OpenVPN</b> — cek kualitas\n\n" +
+          "Balas (reply) pesan ini dengan salah satu:\n" +
+          "• file <b>.ovpn</b> (kirim sebagai dokumen), atau\n" +
+          "• <b>tempel isi config-nya</b> sebagai teks, atau\n" +
+          "• <b>link raw</b> config-nya — bot akan mengambil dari link itu.\n\n" +
+          "Bila config-nya butuh username/password, bot akan memintanya " +
+          "setelah ini; bila tidak, pengecekan langsung dimulai.\n" +
+          "Catatan: config dipakai dulu untuk cek kualitas. Setelah kamu " +
+          "pilih format, config-nya perlu dikirim ulang, karena bot " +
+          "tidak menyimpan config.\n\n" +
+          `<code>pre:${videoId}</code>\novpn:cfg`,
+        reply_markup: { force_reply: true, input_field_placeholder: "File .ovpn / teks config / link raw" },
+      });
+      return;
+    }
+
+    if (action === "l") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Balas pesan perintah dengan link config-nya." });
+      await clearKeyboard(env, chatId, messageId);
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text:
+          "🌐 <b>Download config OpenVPN dari link</b> — cek kualitas\n\n" +
+          "Balas (reply) pesan ini dengan <b>link download config</b> " +
+          ".ovpn-nya (mis. link unduhan VPNGate) — bot akan mengambil " +
+          "config-nya dari link itu. Bila config-nya butuh username/" +
+          "password, bot akan memintanya setelah ini; bila tidak, " +
+          "pengecekan langsung dimulai.\n" +
+          "Catatan: config dipakai dulu untuk cek kualitas. Setelah kamu " +
+          "pilih format, config-nya perlu dikirim ulang, karena bot " +
+          "tidak menyimpan config.\n\n" +
+          `<code>pre:${videoId}</code>\novpn:link`,
+        reply_markup: { force_reply: true, input_field_placeholder: "https://... link config .ovpn" },
+      });
+      return;
+    }
+
+    if (action === "c") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Balas pesan perintah dengan URL proxy-nya." });
+      await clearKeyboard(env, chatId, messageId);
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text:
+          "🔌 <b>Download menggunakan proxy custom</b> — cek kualitas\n\n" +
+          "Balas (reply) pesan ini dengan URL proxy-nya saja, contoh:\n" +
+          "<code>socks5://user:pass@host:port</code>\n" +
+          "Skema yang didukung: http, https, socks4, socks5.\n" +
+          "Format host:port:user:pass dari penjual proxy juga diterima, " +
+          "nanti diubah otomatis ke bentuk URL.\n\n" +
+          "Proxy ini dipakai dulu untuk mengecek kualitas, lalu dipakai " +
+          "lagi untuk download setelah kamu pilih format.\n\n" +
+          `<code>pre:${videoId}</code>`,
+        reply_markup: { force_reply: true, input_field_placeholder: "socks5://user:pass@host:port" },
+      });
+      return;
+    }
+    return;
+  }
 
   // Menu cara download: px:<videoId>:<choice>:<n|c|v|o|l|x>
   // (n = tanpa proxy, c = proxy custom, v = profile OpenVPN tersimpan,
@@ -680,30 +927,6 @@ async function handleCallback(env, query) {
     }
     return;
   }
-
-  // Tombol format dari hasil probe: dl:<videoId>:<choice>
-  if (parts.length !== 3 || parts[0] !== "dl") return;
-  const [, videoId, choice] = parts;
-
-  if (choice === "cancel") {
-    await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
-    if (messageId) {
-      await tg(env, "editMessageCaption", { chat_id: chatId, message_id: messageId, caption: "✖️ Dibatalkan." }).catch(() => {});
-    }
-    return;
-  }
-  const label = choiceLabel(choice);
-  if (!label) return;
-
-  // Jangan langsung download: tawarkan dulu 6 cara download.
-  await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `${label} — pilih cara download.` });
-  await clearKeyboard(env, chatId, messageId);
-  await tg(env, "sendMessage", {
-    chat_id: chatId,
-    parse_mode: "HTML",
-    text: `<b>${label}</b>\nPilih cara download:`,
-    reply_markup: downloadChoiceKeyboard(videoId, choice),
-  });
 }
 
 // ---------------------------------------------------------------- entry

@@ -31,10 +31,17 @@ Sebelum kirim, metadata video (durasi/lebar/tinggi dari ffprobe) dan
 satu frame thumbnail dilampirkan ke sendVideo — tanpa itu Telegram di
 HP bisa menampilkan durasi 0:00 dan pratinjau kosong.
 
-Mode probe: ekstrak info video (tanpa download) -> hitung resolusi yang
-BENAR-BENAR tersedia (maks 4320p/8K) + perkiraan ukuran tiap format ->
-kirim foto + tombol format dinamis ke Telegram. Tombolnya diklik lewat
-webhook Worker seperti biasa, lalu mode download yang bekerja.
+Mode probe: ekstrak info video (tanpa download) memakai proxy/VPN yang
+dipilih user saat kirim link (bukan tanpa proxy seperti dulu) -> hitung
+resolusi yang BENAR-BENAR tersedia (maks 4320p/8K) + perkiraan ukuran
+tiap format -> kirim foto + tombol format dinamis ke Telegram. Tombol
+format membawa cara yang dipakai probe ("dl:<id>:<choice>|<n|v|p<proxy>>")
+supaya klik format langsung download dengan cara yang sama; bila probe
+memakai config OpenVPN custom, tombolnya polos (config tidak bisa dibawa
+lewat callback Telegram, maks 64 byte) dan Worker menampilkan lagi menu
+cara download. Bila probe gagal (mis. bot-check YouTube), pesan gagalnya
+memasang menu cara probe ("pre:<id>:<aksi>") supaya user bisa langsung
+mencoba cara lain tanpa mengirim link ulang.
 """
 
 from __future__ import annotations
@@ -143,8 +150,11 @@ def tg_post(method: str, **kwargs) -> dict:
     return data
 
 
-def send_text(chat_id: str, text: str) -> int | None:
-    data = tg_post("sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+def send_text(chat_id: str, text: str, reply_markup: dict | None = None) -> int | None:
+    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    data = tg_post("sendMessage", json=payload)
     return (data.get("result") or {}).get("message_id")
 
 
@@ -185,6 +195,28 @@ def download_choice_keyboard(video_id: str, choice_key: str) -> dict:
           "callback_data": f"px:{video_id}:{choice_key}:l"}],
         [{"text": "✖️ Batalkan / Cancel tugas",
           "callback_data": f"px:{video_id}:{choice_key}:x"}],
+    ]}
+
+
+def probe_choice_keyboard(video_id: str) -> dict:
+    """Tombol 6 cara probe (callback pre:<vid>:<n|c|v|o|l|x>) — sama
+    seperti yang dibuat Worker saat link pertama dikirim. Dipasang
+    pada pesan gagal probe supaya user bisa langsung mencoba cara lain
+    (mis. tanpa proxy -> proxy custom / OpenVPN) tanpa mengirim link
+    ulang."""
+    return {"inline_keyboard": [
+        [{"text": "⬇️ Download tanpa proxy",
+          "callback_data": f"pre:{video_id}:n"}],
+        [{"text": "🔌 Download menggunakan proxy custom",
+          "callback_data": f"pre:{video_id}:c"}],
+        [{"text": "🛡️ Gunakan profile OpenVPN yang tersimpan",
+          "callback_data": f"pre:{video_id}:v"}],
+        [{"text": "📄 Gunakan custom config OpenVPN",
+          "callback_data": f"pre:{video_id}:o"}],
+        [{"text": "🌐 Download config OpenVPN dari link",
+          "callback_data": f"pre:{video_id}:l"}],
+        [{"text": "✖️ Batalkan / Cancel tugas",
+          "callback_data": f"pre:{video_id}:x"}],
     ]}
 
 
@@ -377,6 +409,31 @@ def _proxy_url() -> str:
 
 
 PROXY = _proxy_url()
+
+# Cara yang dipakai run ini (diteruskan workflow dari input dispatch):
+# USE_VPN=1 bila OpenVPN disambungkan sebelum probe/download,
+# OVPN_CUSTOM=true bila config-nya custom dari user (bukan profile
+# tersimpan). Dipakai run_probe untuk menyematkan cara yang sama ke
+# tombol format, supaya klik format langsung download tanpa tanya lagi.
+USE_VPN = os.environ.get("USE_VPN", "").strip() == "1"
+OVPN_CUSTOM = os.environ.get("OVPN_CUSTOM", "").strip().lower() == "true"
+
+
+def _reuse_suffix_for(base: str) -> str:
+    """Akhiran tombol format yang membawa cara probe ("|n" / "|v" /
+    "|p<proxy>") supaya download memakai cara yang sama. Kosong bila
+    cara itu tidak bisa dibawa: config OpenVPN custom terlalu besar
+    untuk callback Telegram (maks 64 byte), atau proxy terlalu panjang
+    sehingga total callback melewati 64 byte."""
+    if USE_VPN and OVPN_CUSTOM:
+        return ""
+    if USE_VPN:
+        suffix = "|v"
+    elif PROXY:
+        suffix = f"|p{PROXY}"
+    else:
+        suffix = "|n"
+    return suffix if len(base) + len(suffix) <= 64 else ""
 
 
 def _attempt_extras() -> list[tuple[dict, str]]:
@@ -625,7 +682,13 @@ def run_probe(chat_id: str, url: str) -> int:
             raise RuntimeError("Tidak ada format yang bisa diunduh dari video ini.")
 
         vid = opts["video_id"]
-        kb = lambda choice: f"dl:{vid}:{choice}"  # noqa: E731
+
+        def kb(choice: str) -> str:
+            base = f"dl:{vid}:{choice}"
+            if choice == "cancel":
+                return base
+            return base + _reuse_suffix_for(base)
+
         rows: list[list[dict]] = []
         row: list[dict] = []
         for h, size, fps in opts["buckets"]:
@@ -681,10 +744,15 @@ def run_probe(chat_id: str, url: str) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"PROBE ERROR: {e}", file=sys.stderr)
         text = _user_error_text(e)
+        kb = None
+        m = _VIDEO_ID_RE.search(url)
+        if m:
+            kb = probe_choice_keyboard(m.group(1))
+            text += "\n\nPilih cara lain untuk mencoba lagi:"
         if placeholder_id:
-            edit_text(chat_id, placeholder_id, text)
+            edit_text(chat_id, placeholder_id, text, reply_markup=kb)
         else:
-            send_text(chat_id, text)
+            send_text(chat_id, text, reply_markup=kb)
         return 1
 
 
@@ -712,9 +780,10 @@ def _user_error_text(e: Exception) -> str:
             "❌ YouTube memblokir IP server GitHub Actions "
             "(bot-check: \"Sign in to confirm you're not a bot\") "
             "setelah semua client dicoba.\n\n"
-            "Coba lagi beberapa menit — IP runner berganti tiap run, "
-            "sebagian tidak diblokir. Bila terus gagal, pemilik bot "
-            "perlu memasang cookies YouTube (secret YOUTUBE_COOKIES)."
+            "Coba lagi dengan proxy / OpenVPN lewat tombol di bawah — "
+            "IP runner berganti tiap run, sebagian tidak diblokir. "
+            "Bila terus gagal, pemilik bot perlu memasang cookies "
+            "YouTube (secret YOUTUBE_COOKIES)."
         )
     return (
         f"❌ Gagal memproses video ini.\n<code>{escape_html(str(e)[:250])}</code>\n\n"
