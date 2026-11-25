@@ -16,12 +16,15 @@ Input lewat environment variable (bukan argumen shell, agar aman dari injection)
                       login sebagai bot): file 50 MB - 2 GB bisa dikirim.
                       Tanpa ini, batas kirim tetap 50 MB (Bot API).
   YT_COOKIES_FILE     (opsional) path file cookies YouTube dari secret
-  PROXY               (opsional) URL proxy untuk yt-dlp pada mode
-                      download saja — dipilih user setelah klik resolusi
-                      ("Download menggunakan proxy custom") lalu
-                      diteruskan Worker ke sini. Mode probe selalu
-                      berjalan tanpa proxy. Skema: http, https, socks4,
-                      socks4a, socks5, socks5h. Kosong = tanpa proxy.
+  PROXY               (opsional) proxy untuk yt-dlp — satu URL, atau
+                      DAFTAR (bulk) dipisah spasi / baris baru / koma.
+                      Dipilih user ("Download menggunakan proxy custom")
+                      lalu diteruskan Worker ke sini. Proxy dicoba
+                      satu-satu sampai ada yang berhasil (rotasi); bila
+                      sudah berhasil, proxy yang belum dipakai diabaikan,
+                      dan hasilnya dilaporkan ke Telegram (gagal /
+                      berhasil / belum dicoba). Skema: http, https,
+                      socks4, socks4a, socks5, socks5h. Kosong = tanpa proxy.
 
 Mode download: kirim pesan status -> yt-dlp download + convert (ffmpeg) ->
 cek batas ukuran -> kirim file ke Telegram -> hapus pesan status.
@@ -34,11 +37,14 @@ HP bisa menampilkan durasi 0:00 dan pratinjau kosong.
 Mode probe: ekstrak info video (tanpa download) memakai proxy/VPN yang
 dipilih user saat kirim link (bukan tanpa proxy seperti dulu) -> hitung
 resolusi yang BENAR-BENAR tersedia (maks 4320p/8K) + perkiraan ukuran
-tiap format -> kirim foto + tombol format dinamis ke Telegram. Tombol
-format membawa cara yang dipakai probe ("dl:<id>:<choice>|<n|v|p<proxy>>")
-supaya klik format langsung download dengan cara yang sama; bila probe
-memakai config OpenVPN custom, tombolnya polos (config tidak bisa dibawa
-lewat callback Telegram, maks 64 byte) dan Worker menampilkan lagi menu
+tiap format -> kirim foto + tombol format dinamis ke Telegram. Bila
+user mengirim bulk proxy, probe mencoba satu-satu sampai ada yang
+berhasil; proxy yang berhasil dibawa tombol format
+("dl:<id>:<choice>|<n|v|p<proxy>>") supaya klik format langsung
+download dengan cara yang sama, dan laporan proxy (gagal / berhasil /
+belum dicoba) dikirim sebagai pesan terpisah. Bila probe memakai config
+OpenVPN custom, tombolnya polos (config tidak bisa dibawa lewat
+callback Telegram, maks 64 byte) dan Worker menampilkan lagi menu
 cara download. Bila probe gagal (mis. bot-check YouTube), pesan gagalnya
 memasang menu cara probe ("pre:<id>:<aksi>") supaya user bisa langsung
 mencoba cara lain tanpa mengirim link ulang.
@@ -386,13 +392,13 @@ _PROXY_COLON_RE = re.compile(
 _PROXY_BARE_AUTH_RE = re.compile(r"^[^\s:@/]+:[^\s:@/]+@[\w.-]+:\d{1,5}$")
 
 
-def _proxy_url() -> str:
-    """URL proxy dari env PROXY (diteruskan Worker), divalidasi skemanya.
+def _normalize_proxy_token(token: str) -> str:
+    """Satu token proxy -> URL standar, atau "" bila bukan proxy valid.
 
     Format host:port:user:pass dan user:pass@host:port (tanpa skema)
     dinormalisasi dulu ke URL standar.
     """
-    proxy = os.environ.get("PROXY", "").strip()
+    proxy = (token or "").strip()
     if not proxy:
         return ""
     m = _PROXY_COLON_RE.match(proxy)
@@ -408,7 +414,27 @@ def _proxy_url() -> str:
     return ""
 
 
-PROXY = _proxy_url()
+MAX_PROXIES = 10
+
+
+def _proxy_list() -> list[str]:
+    """Daftar proxy dari env PROXY (diteruskan Worker; satu URL, atau
+    bulk dipisah spasi / baris baru / koma). Tanpa proxy = [""].
+    Duplikat dibuang, maks MAX_PROXIES — sisanya diabaikan."""
+    raw = os.environ.get("PROXY", "").strip()
+    if not raw:
+        return [""]
+    out: list[str] = []
+    for tok in re.split(r"[\s,;]+", raw):
+        norm = _normalize_proxy_token(tok)
+        if norm and norm not in out:
+            out.append(norm)
+        if len(out) >= MAX_PROXIES:
+            break
+    return out or [""]
+
+
+PROXY_LIST = _proxy_list()
 
 # Cara yang dipakai run ini (diteruskan workflow dari input dispatch):
 # USE_VPN=1 bila OpenVPN disambungkan sebelum probe/download,
@@ -419,21 +445,119 @@ USE_VPN = os.environ.get("USE_VPN", "").strip() == "1"
 OVPN_CUSTOM = os.environ.get("OVPN_CUSTOM", "").strip().lower() == "true"
 
 
-def _reuse_suffix_for(base: str) -> str:
+def _reuse_suffix_for(base: str, proxy: str = "") -> str:
     """Akhiran tombol format yang membawa cara probe ("|n" / "|v" /
     "|p<proxy>") supaya download memakai cara yang sama. Kosong bila
     cara itu tidak bisa dibawa: config OpenVPN custom terlalu besar
     untuk callback Telegram (maks 64 byte), atau proxy terlalu panjang
-    sehingga total callback melewati 64 byte."""
+    sehingga total callback melewati 64 byte. `proxy` = proxy yang
+    BERHASIL saat probe (dari laporan rotasi), bukan sembarang daftar."""
     if USE_VPN and OVPN_CUSTOM:
         return ""
     if USE_VPN:
         suffix = "|v"
-    elif PROXY:
-        suffix = f"|p{PROXY}"
+    elif proxy:
+        suffix = f"|p{proxy}"
     else:
         suffix = "|n"
     return suffix if len(base) + len(suffix) <= 64 else ""
+
+
+def _mask_proxy(proxy: str) -> str:
+    """Tampilan aman proxy untuk laporan: skema://host (tanpa user:pass)."""
+    if not proxy:
+        return "tanpa proxy"
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(proxy)
+        return f"{u.scheme}://{u.hostname}" if u.hostname else "(proxy)"
+    except Exception:  # noqa: BLE001 - tampilan gagal tidak boleh menggagalkan laporan
+        return "(proxy)"
+
+
+# Error yang BUKAN salah proxy (video privat / dihapus / dibatasi usia):
+# mencoba proxy lain tidak ada gunanya, jadi rotasi berhenti langsung.
+_DEFINITIVE_ERR_MARKERS = (
+    "private video", "video unavailable", "this video is unavailable",
+    "no longer available", "has been removed", "removed by the uploader",
+    "confirm your age", "age-gated", "copyright",
+    "account has been terminated",
+)
+
+
+def _is_definitive_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return any(m in s for m in _DEFINITIVE_ERR_MARKERS)
+
+
+def _short_reason(e: Exception) -> str:
+    """Alasan gagal yang singkat untuk laporan proxy."""
+    s = str(e)
+    if "Sign in to confirm" in s:
+        return "diblokir YouTube (bot-check)"
+    if any(m in s.lower() for m in _PROXY_ERR_MARKERS):
+        return "proxy tidak bisa dihubungi"
+    return (s[:80] + "…") if len(s) > 80 else s
+
+
+class _AllProxiesFailed(Exception):
+    """Semua proxy gagal; membawa laporan rotasi untuk pesan ke user."""
+    def __init__(self, report: dict, last_error: Exception):
+        super().__init__(str(last_error))
+        self.report = report
+        self.last_error = last_error
+
+
+def _proxy_report_text(report: dict, *, what: str) -> str:
+    """Laporan bulk proxy: berhasil / gagal (+alasan) / belum dicoba."""
+    lines = [f"🔌 Laporan proxy ({what}):"]
+    if report["used"]:
+        lines.append(
+            f"✅ Berhasil: {_mask_proxy(report['used'])} "
+            f"(proxy ke-{report['used_index'] + 1} dari {report['total']})")
+    for proxy, reason in report["failed"]:
+        lines.append(f"❌ Gagal: {_mask_proxy(proxy)} — {escape_html(reason)}")
+    if report["untried"]:
+        lines.append("⏭️ Belum dicoba: " +
+                     ", ".join(_mask_proxy(p) for p in report["untried"]))
+    return "\n".join(lines)
+
+
+def _rotate_proxies(fn, *, progress=None):
+    """Coba fn(proxy) untuk tiap proxy di PROXY_LIST sampai berhasil.
+
+    fn(proxy) mengembalikan hasil atau raise. Mengembalikan
+    (hasil, report) dengan report = {"used", "used_index", "failed":
+    [(proxy, alasan)], "untried": [...], "total": n}. Bila semua gagal,
+    raise _AllProxiesFailed yang membawa report-nya. Error definitif
+    (video privat/dihapus/dibatasi usia) menghentikan rotasi langsung,
+    karena bukan salah proxy. progress(idx, total, proxy) dipanggil
+    sebelum tiap percobaan bila proxy-nya lebih dari satu (untuk
+    update pesan status di Telegram)."""
+    failed: list[tuple[str, str]] = []
+    for idx, proxy in enumerate(PROXY_LIST):
+        if progress and len(PROXY_LIST) > 1:
+            progress(idx, len(PROXY_LIST), proxy)
+        try:
+            result = fn(proxy)
+        except Exception as e:  # noqa: BLE001 - putuskan: lanjut / berhenti
+            if _is_definitive_error(e):
+                raise
+            failed.append((proxy, _short_reason(e)))
+            print(f"Proxy {idx + 1}/{len(PROXY_LIST)} ({_mask_proxy(proxy)}) "
+                  f"gagal: {e}", file=sys.stderr)
+            continue
+        return result, {
+            "used": proxy, "used_index": idx,
+            "failed": failed, "untried": PROXY_LIST[idx + 1:],
+            "total": len(PROXY_LIST),
+        }
+    last = failed[-1][1] if failed else "gagal"
+    raise _AllProxiesFailed(
+        {"used": "", "used_index": None, "failed": failed,
+         "untried": [], "total": len(PROXY_LIST)},
+        RuntimeError(f"Semua {len(PROXY_LIST)} proxy gagal (terakhir: {last})"),
+    )
 
 
 def _attempt_extras() -> list[tuple[dict, str]]:
@@ -474,14 +598,14 @@ _PROXY_ERR_MARKERS = (
 )
 
 
-def _is_proxy_conn_error(e: Exception) -> bool:
-    if not PROXY:
+def _is_proxy_conn_error(e: Exception, proxy: str = "") -> bool:
+    if not proxy:
         return False
     s = str(e).lower()
     return any(m in s for m in _PROXY_ERR_MARKERS)
 
 
-def _base_opts() -> dict:
+def _base_opts(proxy: str = "") -> dict:
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "retries": 10, "fragment_retries": 10, "socket_timeout": 30,
@@ -492,14 +616,15 @@ def _base_opts() -> dict:
         # (web_safari, tv_samsung, dll) yang kosong tanpa komponen ini.
         "remote_components": ["ejs:github"],
     }
-    if PROXY:
+    if proxy:
         # Semua trafik yt-dlp (probe maupun download) lewat proxy ini.
-        opts["proxy"] = PROXY
+        opts["proxy"] = proxy
     return opts
 
 
-def download_media(url: str, choice: dict, out_dir: Path) -> tuple[Path, str]:
-    base_opts = _base_opts()
+def _download_with_one_proxy(url: str, choice: dict, out_dir: Path,
+                             proxy: str) -> tuple[Path, str]:
+    base_opts = _base_opts(proxy)
     base_opts.update({
         "format": choice["format"],
         "outtmpl": str(out_dir / "%(title).80s.%(ext)s"),
@@ -524,7 +649,7 @@ def download_media(url: str, choice: dict, out_dir: Path) -> tuple[Path, str]:
             last_error = e
             print(f"Percobaan {i}/{len(attempts)} (client={label}) "
                   f"gagal: {e}", file=sys.stderr)
-            if _is_proxy_conn_error(e):
+            if _is_proxy_conn_error(e, proxy):
                 raise
             # Bersihkan hasil parsial attempt ini, TAPI simpan file .part:
             # attempt berikutnya bisa melanjutkannya (resume) alih-alih
@@ -551,12 +676,22 @@ def download_media(url: str, choice: dict, out_dir: Path) -> tuple[Path, str]:
     raise last_error or RuntimeError("Semua percobaan download gagal.")
 
 
-def extract_info_probe(url: str) -> dict:
+def download_media(url: str, choice: dict, out_dir: Path, *,
+                   on_proxy=None) -> tuple[tuple[Path, str], dict]:
+    """Download memakai rotasi proxy; mengembalikan ((file, judul), report).
+    on_proxy(idx, total, proxy) dipanggil sebelum tiap proxy dicoba."""
+    return _rotate_proxies(
+        lambda p: _download_with_one_proxy(url, choice, out_dir, p),
+        progress=on_proxy,
+    )
+
+
+def _probe_with_one_proxy(url: str, proxy: str) -> dict:
     """Ekstrak info lengkap (tanpa download) memakai tangga client yang sama."""
     attempts = _attempt_extras()
     last_error: Exception | None = None
     for i, (extra, label) in enumerate(attempts, 1):
-        opts = {**_base_opts(), **extra}
+        opts = {**_base_opts(proxy), **extra}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -564,7 +699,7 @@ def extract_info_probe(url: str) -> dict:
             last_error = e
             print(f"Probe percobaan {i}/{len(attempts)} (client={label}) "
                   f"gagal: {e}", file=sys.stderr)
-            if _is_proxy_conn_error(e):
+            if _is_proxy_conn_error(e, proxy):
                 raise
             continue
         if info and "entries" in info:
@@ -572,6 +707,15 @@ def extract_info_probe(url: str) -> dict:
         print(f"Probe berhasil dengan percobaan {i}/{len(attempts)} (client={label})")
         return info
     raise last_error or RuntimeError("Semua percobaan probe gagal.")
+
+
+def extract_info_probe(url: str, *, on_proxy=None) -> tuple[dict, dict]:
+    """Ekstrak info memakai rotasi proxy; mengembalikan (info, report).
+    on_proxy(idx, total, proxy) dipanggil sebelum tiap proxy dicoba."""
+    return _rotate_proxies(
+        lambda p: _probe_with_one_proxy(url, p),
+        progress=on_proxy,
+    )
 
 
 def _fmt_size_est(f: dict, duration: int) -> int:
@@ -675,8 +819,16 @@ def compute_options(info: dict) -> dict:
 def run_probe(chat_id: str, url: str) -> int:
     placeholder_raw = os.environ.get("PROBE_MESSAGE_ID", "").strip()
     placeholder_id = int(placeholder_raw) if placeholder_raw.isdigit() else None
+
+    def _on_proxy(idx: int, total: int, proxy: str) -> None:
+        if placeholder_id:
+            edit_text(chat_id, placeholder_id,
+                      "🔍 Sedang memeriksa kualitas & ukuran yang tersedia...\n"
+                      f"(proxy ke-{idx + 1} dari {total}: {_mask_proxy(proxy)})")
+
     try:
-        info = extract_info_probe(url)
+        info, proxy_report = extract_info_probe(url, on_proxy=_on_proxy)
+        used_proxy = proxy_report["used"]
         opts = compute_options(info)
         if not opts["buckets"] and not opts["m4a_size"]:
             raise RuntimeError("Tidak ada format yang bisa diunduh dari video ini.")
@@ -687,7 +839,9 @@ def run_probe(chat_id: str, url: str) -> int:
             base = f"dl:{vid}:{choice}"
             if choice == "cancel":
                 return base
-            return base + _reuse_suffix_for(base)
+            # Suffix membawa proxy yang BERHASIL saat probe, supaya
+            # download langsung memakai proxy itu (bukan daftar bulk).
+            return base + _reuse_suffix_for(base, used_proxy)
 
         rows: list[list[dict]] = []
         row: list[dict] = []
@@ -739,11 +893,16 @@ def run_probe(chat_id: str, url: str) -> int:
                 "chat_id": chat_id, "text": caption, "parse_mode": "HTML",
                 "reply_markup": {"inline_keyboard": rows},
             })
+        if len(PROXY_LIST) > 1:
+            send_text(chat_id, _proxy_report_text(proxy_report, what="cek kualitas"))
         print(f"Probe terkirim: {len(opts['buckets'])} resolusi untuk chat {chat_id}")
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"PROBE ERROR: {e}", file=sys.stderr)
         text = _user_error_text(e)
+        report = getattr(e, "report", None)
+        if report and len(PROXY_LIST) > 1:
+            text += "\n\n" + _proxy_report_text(report, what="cek kualitas")
         kb = None
         m = _VIDEO_ID_RE.search(url)
         if m:
@@ -757,7 +916,9 @@ def run_probe(chat_id: str, url: str) -> int:
 
 
 def _user_error_text(e: Exception) -> str:
-    if "Port could not be cast" in str(e):
+    # Bila error dibungkus _AllProxiesFailed, periksa error aslinya.
+    inner = getattr(e, "last_error", None) or e
+    if "Port could not be cast" in str(inner):
         return (
             "❌ Format proxy-nya tidak valid — bagian port terbaca bukan angka.\n\n"
             "Kirim proxy dalam format URL standar:\n"
@@ -766,7 +927,7 @@ def _user_error_text(e: Exception) -> str:
             "Format host:port:user:pass dari penjual proxy juga diterima "
             "dan diubah otomatis. Coba lagi lewat tombol 🔌 di bawah."
         )
-    if _is_proxy_conn_error(e):
+    if any(_is_proxy_conn_error(inner, p) for p in PROXY_LIST if p):
         return (
             "❌ Proxy-nya tidak bisa dipakai: koneksi ke proxy gagal / ditolak.\n\n"
             "Permintaan belum sempat sampai ke YouTube — proxy kemungkinan "
@@ -775,7 +936,7 @@ def _user_error_text(e: Exception) -> str:
             "dipakai download besar. Ganti proxy lain lewat tombol 🔌 "
             "di bawah, atau pilih download tanpa proxy."
         )
-    if "Sign in to confirm" in str(e):
+    if "Sign in to confirm" in str(inner):
         return (
             "❌ YouTube memblokir IP server GitHub Actions "
             "(bot-check: \"Sign in to confirm you're not a bot\") "
@@ -814,8 +975,14 @@ def main() -> int:
 
     status_id = send_text(chat_id, f"⬇️ Mengunduh {choice['label']}...\nProses di GitHub Actions, mohon tunggu.")
     work = Path(tempfile.mkdtemp(prefix="yt-"))
+
+    def _on_proxy(idx: int, total: int, proxy: str) -> None:
+        if status_id:
+            edit_text(chat_id, status_id,
+                      f"⬇️ Mengunduh {choice['label']}...\n(proxy ke-{idx + 1} dari {total}: {_mask_proxy(proxy)})")
+
     try:
-        file_path, title = download_media(url, choice, work)
+        (file_path, title), proxy_report = download_media(url, choice, work, on_proxy=_on_proxy)
         size = file_path.stat().st_size
         if size > MAX_SIZE_MTPROTO:
             edit_text(chat_id, status_id,
@@ -847,6 +1014,8 @@ def main() -> int:
             send_large(chat_id, file_path, caption, choice["kind"], meta, thumb)
             if status_id:
                 tg_post("deleteMessage", json={"chat_id": chat_id, "message_id": status_id})
+            if len(PROXY_LIST) > 1:
+                send_text(chat_id, _proxy_report_text(proxy_report, what="download"))
             print(f"OK (MTProto): terkirim {file_path.name} ({fmt_size(size)}) ke chat {chat_id}")
             return 0
 
@@ -884,11 +1053,16 @@ def main() -> int:
 
         if status_id:
             tg_post("deleteMessage", json={"chat_id": chat_id, "message_id": status_id})
+        if len(PROXY_LIST) > 1:
+            send_text(chat_id, _proxy_report_text(proxy_report, what="download"))
         print(f"OK: terkirim {file_path.name} ({fmt_size(size)}) ke chat {chat_id}")
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"ERROR: {e}", file=sys.stderr)
         text = _user_error_text(e)
+        report = getattr(e, "report", None)
+        if report and len(PROXY_LIST) > 1:
+            text += "\n\n" + _proxy_report_text(report, what="download")
         kb = None
         m = _VIDEO_ID_RE.search(url)
         if m:

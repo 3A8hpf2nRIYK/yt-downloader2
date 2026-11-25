@@ -159,7 +159,14 @@ mengirim link ulang.
   `socks4a`, `socks5`, `socks5h`), lalu download berjalan memakai
   proxy itu. Pesan perintah membawa kode tugas `px:<videoId>:<choice>`
   yang dibaca Worker dari pesan yang dibalas — tanpa penyimpanan
-  antar-request.
+  antar-request. **Bulk proxy:** user boleh mengirim beberapa proxy
+  sekaligus (satu per baris, atau dipisah spasi/koma; maks 10) —
+  downloader mencoba satu-satu sampai ada yang berhasil; bila sudah
+  berhasil, proxy yang belum dipakai diabaikan, dan bot mengirim
+  laporan: mana yang gagal (+alasannya), mana yang berhasil, dan mana
+  yang belum dicoba. Proxy yang berhasil saat probe dibawa tombol
+  format, jadi download langsung memakai proxy itu tanpa mencoba
+  ulang daftarnya.
 - **🛡️ Gunakan profile OpenVPN yang tersimpan** — workflow
   menyambungkan OpenVPN sebelum download dan memutuskannya
   sesudahnya; seluruh trafik download berjalan lewat VPN. Config-nya

@@ -22,7 +22,9 @@
  *      "Tanpa proxy" langsung trigger mode "download"; "proxy custom"
  *      membalas user dengan pesan perintah (force reply) yang membawa
  *      kode tugas "px:<videoId>:<choice>" — user membalasnya dengan
- *      URL proxy, lalu download ditrigger memakai proxy itu.
+ *      URL proxy (boleh beberapa sekaligus, bulk; downloader mencoba
+ *      satu-satu sampai ada yang berhasil), lalu download ditrigger
+ *      memakai proxy itu.
  *      "Profile tersimpan" mentrigger download dengan input use_vpn=1
  *      (workflow menyambungkan VPN dari secret OPENVPN_CONFIG).
  *      "Custom config" meminta user membalas prompt dengan file .ovpn,
@@ -106,6 +108,15 @@ function maskProxy(proxy) {
   } catch {
     return "(proxy)";
   }
+}
+
+// Tampilan aman untuk DAFTAR proxy (bulk, dipisah spasi): proxy pertama
+// + jumlah sisanya, supaya pesan status tidak kepanjangan.
+function maskProxyList(proxy) {
+  const list = String(proxy || "").split(/\s+/).filter(Boolean);
+  if (!list.length) return "";
+  const first = maskProxy(list[0]);
+  return list.length === 1 ? first : `${first} (+${list.length - 1} lainnya)`;
 }
 
 export function extractVideoId(text) {
@@ -281,7 +292,7 @@ async function startDownload(env, { chatId, videoId, choice, proxy = "", useVpn 
       text:
         `⏳ <b>${label}</b> sedang diproses di GitHub Actions.\n` +
         "File akan dikirim ke chat ini setelah selesai (biasanya 1-3 menit). Mohon tunggu, jangan spam ya." +
-        (proxy ? `\n🔌 Proxy: ${maskProxy(proxy)}` : "") +
+        (proxy ? `\n🔌 Proxy: ${maskProxyList(proxy)}` : "") +
         (useVpn && ovpn ? "\n🛡️ VPN: OpenVPN (custom config)" : "") +
         (useVpn && !ovpn ? "\n🛡️ VPN: OpenVPN (profile tersimpan)" : ""),
     });
@@ -308,7 +319,7 @@ async function startProbe(env, { chatId, videoId, proxy = "", useVpn = false, ov
     text:
       "🔍 Sedang memeriksa kualitas & ukuran yang tersedia...\n" +
       "(sekitar 1 menit, prosesnya di GitHub Actions)" +
-      (proxy ? `\n🔌 Proxy: ${maskProxy(proxy)}` : "") +
+      (proxy ? `\n🔌 Proxy: ${maskProxyList(proxy)}` : "") +
       (useVpn && ovpn ? "\n🛡️ VPN: OpenVPN (custom config)" : "") +
       (useVpn && !ovpn ? "\n🛡️ VPN: OpenVPN (profile tersimpan)" : ""),
   });
@@ -570,28 +581,46 @@ async function handleMessage(env, message) {
         return;
       }
 
-      const candidate = String(text).split(/\s+/)
-        .map((w) => normalizeProxyToken(w))
-        .find((w) => w && !/(?:youtube\.com|youtu\.be)/i.test(w)) || "";
-      if (!candidate) {
+      // Bulk proxy: user boleh mengirim BEBERAPA proxy sekaligus
+      // (satu per baris, atau dipisah spasi/koma). Semuanya
+      // dinormalisasi + didedup, maks 10 — downloader mencoba satu-satu
+      // sampai ada yang berhasil, sisanya yang belum dipakai diabaikan.
+      const tokens = String(text).split(/[\s,;]+/).filter(Boolean);
+      const candidates = [];
+      let skipped = 0;
+      for (const w of tokens) {
+        if (/(?:youtube\.com|youtu\.be)/i.test(w)) continue;
+        const norm = normalizeProxyToken(w);
+        if (norm && !candidates.includes(norm)) candidates.push(norm);
+        else if (!norm) skipped++;
+      }
+      const picked = candidates.slice(0, 10);
+      if (!picked.length) {
         await tg(env, "sendMessage", {
           chat_id: chatId,
           text:
             "❌ Itu bukan proxy yang valid. Balas pesan perintah tadi " +
             "dengan proxy-nya saja, contoh:\nsocks5://user:pass@host:port\n" +
-            "atau format host:port:user:pass dari penjual proxy.",
+            "atau format host:port:user:pass dari penjual proxy.\n" +
+            "Bisa juga kirim beberapa proxy sekaligus (satu per baris) — " +
+            "bot mencoba satu-satu sampai ada yang berhasil.",
         });
         return;
       }
       if (replied.message_id) {
+        const note = picked.length > 1
+          ? `✅ ${picked.length} proxy diterima (${maskProxyList(picked.join(" "))}). Dicoba satu-satu sampai ada yang berhasil...`
+          : `✅ Proxy diterima (${maskProxy(picked[0])}).`;
+        const extra = skipped ? ` (${skipped} baris diabaikan, bukan proxy valid)` : "";
+        const capped = candidates.length > 10 ? " (hanya 10 pertama dipakai)" : "";
         await tg(env, "editMessageText", {
           chat_id: chatId, message_id: replied.message_id,
           text: pendingKind === "probe"
-            ? `✅ Proxy diterima (${maskProxy(candidate)}). Pengecekan dimulai...`
-            : `✅ Proxy diterima (${maskProxy(candidate)}). Download dimulai...`,
+            ? `${note}${extra}${capped} Pengecekan dimulai...`
+            : `${note}${extra}${capped} Download dimulai...`,
         }).catch(() => {});
       }
-      await finishPending({ proxy: candidate });
+      await finishPending({ proxy: picked.join(" ") });
       return;
     }
   }
@@ -605,7 +634,8 @@ async function handleMessage(env, message) {
         "Kirimkan link YouTube, lalu pilih dulu cara download-nya:\n" +
         "⬇️ <b>Download tanpa proxy</b> — langsung diproses\n" +
         "🔌 <b>Download menggunakan proxy custom</b> — kamu akan diminta " +
-        "mengirim URL proxy, lalu download memakai proxy itu\n" +
+        "mengirim URL proxy (boleh beberapa sekaligus, dicoba satu-satu " +
+        "sampai berhasil), lalu download memakai proxy itu\n" +
         "🛡️ <b>Gunakan profile OpenVPN yang tersimpan</b> — download " +
         "lewat VPN dari config .ovpn di secret repo\n" +
         "📄 <b>Gunakan custom config OpenVPN</b> — kamu mengirim config " +
@@ -823,7 +853,10 @@ async function handleCallback(env, query) {
           "<code>socks5://user:pass@host:port</code>\n" +
           "Skema yang didukung: http, https, socks4, socks5.\n" +
           "Format host:port:user:pass dari penjual proxy juga diterima, " +
-          "nanti diubah otomatis ke bentuk URL.\n\n" +
+          "nanti diubah otomatis ke bentuk URL.\n" +
+          "Bisa kirim beberapa proxy sekaligus (satu per baris) — bot " +
+          "mencoba satu-satu sampai ada yang berhasil; yang gagal " +
+          "dilaporkan, yang belum dipakai diabaikan.\n\n" +
           "Proxy ini dipakai dulu untuk mengecek kualitas, lalu dipakai " +
           "lagi untuk download setelah kamu pilih format.\n\n" +
           `<code>pre:${videoId}</code>`,
@@ -919,7 +952,10 @@ async function handleCallback(env, query) {
           "<code>socks5://user:pass@host:port</code>\n" +
           "Skema yang didukung: http, https, socks4, socks5.\n" +
           "Format host:port:user:pass dari penjual proxy juga diterima, " +
-          "nanti diubah otomatis ke bentuk URL.\n\n" +
+          "nanti diubah otomatis ke bentuk URL.\n" +
+          "Bisa kirim beberapa proxy sekaligus (satu per baris) — bot " +
+          "mencoba satu-satu sampai ada yang berhasil; yang gagal " +
+          "dilaporkan, yang belum dipakai diabaikan.\n\n" +
           `<code>px:${videoId}:${choice}</code>`,
         reply_markup: { force_reply: true, input_field_placeholder: "socks5://user:pass@host:port" },
       });
