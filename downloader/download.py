@@ -414,7 +414,7 @@ def _normalize_proxy_token(token: str) -> str:
     return ""
 
 
-MAX_PROXIES = 10
+MAX_PROXIES = 50
 
 
 def _proxy_list() -> list[str]:

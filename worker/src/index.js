@@ -583,7 +583,7 @@ async function handleMessage(env, message) {
 
       // Bulk proxy: user boleh mengirim BEBERAPA proxy sekaligus
       // (satu per baris, atau dipisah spasi/koma). Semuanya
-      // dinormalisasi + didedup, maks 10 — downloader mencoba satu-satu
+      // dinormalisasi + didedup, maks 50 — downloader mencoba satu-satu
       // sampai ada yang berhasil, sisanya yang belum dipakai diabaikan.
       const tokens = String(text).split(/[\s,;]+/).filter(Boolean);
       const candidates = [];
@@ -594,7 +594,7 @@ async function handleMessage(env, message) {
         if (norm && !candidates.includes(norm)) candidates.push(norm);
         else if (!norm) skipped++;
       }
-      const picked = candidates.slice(0, 10);
+      const picked = candidates.slice(0, 50);
       if (!picked.length) {
         await tg(env, "sendMessage", {
           chat_id: chatId,
@@ -612,7 +612,7 @@ async function handleMessage(env, message) {
           ? `✅ ${picked.length} proxy diterima (${maskProxyList(picked.join(" "))}). Dicoba satu-satu sampai ada yang berhasil...`
           : `✅ Proxy diterima (${maskProxy(picked[0])}).`;
         const extra = skipped ? ` (${skipped} baris diabaikan, bukan proxy valid)` : "";
-        const capped = candidates.length > 10 ? " (hanya 10 pertama dipakai)" : "";
+        const capped = candidates.length > 50 ? " (hanya 50 pertama dipakai)" : "";
         await tg(env, "editMessageText", {
           chat_id: chatId, message_id: replied.message_id,
           text: pendingKind === "probe"

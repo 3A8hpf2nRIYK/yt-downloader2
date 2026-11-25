@@ -160,7 +160,7 @@ mengirim link ulang.
   proxy itu. Pesan perintah membawa kode tugas `px:<videoId>:<choice>`
   yang dibaca Worker dari pesan yang dibalas — tanpa penyimpanan
   antar-request. **Bulk proxy:** user boleh mengirim beberapa proxy
-  sekaligus (satu per baris, atau dipisah spasi/koma; maks 10) —
+  sekaligus (satu per baris, atau dipisah spasi/koma; maks 50) —
   downloader mencoba satu-satu sampai ada yang berhasil; bila sudah
   berhasil, proxy yang belum dipakai diabaikan, dan bot mengirim
   laporan: mana yang gagal (+alasannya), mana yang berhasil, dan mana
