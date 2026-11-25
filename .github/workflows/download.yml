@@ -29,7 +29,7 @@ on:
         default: ""
         type: string
       proxy:
-        description: "URL proxy untuk yt-dlp (var DEFAULT_PROXY Worker atau perintah proxy user). Kosong = tanpa proxy"
+        description: "Proxy untuk yt-dlp — satu URL, atau DAFTAR (bulk) dipisah spasi/baris baru/koma; dicoba satu-satu sampai berhasil, sisanya yang belum dipakai diabaikan. Kosong = tanpa proxy"
         required: false
         default: ""
         type: string
